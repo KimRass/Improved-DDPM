@@ -2,7 +2,6 @@
     # https://nn.labml.ai/diffusion/ddpm/index.html
     # https://github.com/davidADSP/Generative_Deep_Learning_2nd_Edition/blob/main/notebooks/08_diffusion/01_ddm/ddm.ipynb
     # https://huggingface.co/blog/annotated-diffusion
-    # https://huggingface.co/blog/annotated-diffusion
 
 import torch
 from torch import nn
@@ -18,14 +17,6 @@ from pathlib import Path
 
 
 class ImprovedDDPM(nn.Module):
-    def get_linear_beta_schdule(self):
-        self.beta = torch.linspace(
-            self.init_beta,
-            self.fin_beta,
-            self.n_diffusion_steps,
-            device=self.device,
-        )
-
     def get_cos_beta_schedule(self, s=0.008):
         # "we selected $s$ such that $\sqrt{\beta_{0}}$ was slightly smaller than the pixel bin size
         # $1 / 127.5$, which gives $s = 0.008$."
@@ -43,27 +34,37 @@ class ImprovedDDPM(nn.Module):
         model,
         img_size,
         device,
+        # "100 sampling steps is sufficient to achieve near-optimal FIDs for our fully trained models."
+        n_subsequence_steps=100, # "$K$"
         image_channels=3,
-        n_diffusion_steps=1000,
-        init_beta=0.0001,
-        fin_beta=0.02,
+        # "We could get a boost in log-likelihood by increasing $T$ from 1000 to 4000."
+        n_diffusion_steps=4000, # "$T$"
+        # "We set $\lambda = 0.001$ to prevent $L_{\text{vlb}}$ from overwhelming $L_{\text{simple}}$."
+        vlb_weight=0.001,
     ):
         super().__init__()
 
         self.img_size = img_size
         self.device = device
         self.image_channels = image_channels
+        self.n_subsequence_steps = n_subsequence_steps
         self.n_diffusion_steps = n_diffusion_steps
-        self.init_beta = init_beta
-        self.fin_beta = fin_beta
-
-        self.get_cos_beta_schedule()
-        self.alpha = 1 - self.beta
-        self.alpha_bar = torch.cumprod(self.alpha, dim=0)
-
-        self.beta_tilde = ((1 - self.prev_alpha_bar) / (1 - self.alpha_bar)) * self.beta
+        self.vlb_weight = vlb_weight
 
         self.model = model.to(device)
+
+        self.get_cos_beta_schedule()
+        # print(self.beta.shape, self.alpha_bar.shape, self.prev_alpha_bar.shape)
+
+        # "$\tilde{\beta_{t}} = \frac{1 - \bar{\alpha}_{t - 1}}{1 - \bar{\alpha}_{t}}\beta_{t}$"
+        # self.beta_tilde = ((1 - self.prev_alpha_bar) / (1 - self.alpha_bar)) * self.beta
+        
+        # "To reduce the number of sampling steps from $$ to $K$,
+        # we use $K$ evenly spaced real numbers between $1$ and $T$ (inclusive),
+        # and then round each resulting number to the nearest integer."
+        self.subsequence_step = torch.linspace(
+            0, self.n_diffusion_steps - 1, self.n_subsequence_steps, dtype=torch.long, device=self.device
+        )
 
     @staticmethod
     def index(x, diffusion_step):
@@ -92,21 +93,14 @@ class ImprovedDDPM(nn.Module):
             device=self.device,
         )
 
-    def perform_diffusion_process(self, ori_image, diffusion_step, random_noise=None):
-        alpha_bar_t = self.index(self.new_alpha_bar, diffusion_step=diffusion_step)
-        mean = (alpha_bar_t ** 0.5) * ori_image
-        var = 1 - alpha_bar_t
-        if random_noise is None:
-            random_noise = self.sample_noise(batch_size=ori_image.size(0))
-        noisy_image = mean + (var ** 0.5) * random_noise
-        return noisy_image
+    def get_model_var(self, v, diffusion_step):
+        return self.index(
+            v * torch.log(self.beta) + (1 - v) * torch.log(self.beta_tilde),
+            diffusion_step=diffusion_step,
+        )
 
     def forward(self, noisy_image, diffusion_step):
         return self.model(noisy_image=noisy_image, diffusion_step=diffusion_step)
-
-    @torch.inference_mode()
-    def predict_ori_image(self, noisy_image, noise, alpha_bar_t):
-        return (noisy_image - ((1 - alpha_bar_t) ** 0.5) * noise) / (alpha_bar_t ** 0.5)
 
     def get_mu_tilde(self, ori_image, noisy_image, diffusion_step):
         return self.index(
@@ -118,25 +112,36 @@ class ImprovedDDPM(nn.Module):
         ) * noisy_image
 
     @torch.inference_mode()
-    def take_denoising_step(self, noisy_image, diffusion_step_idx):
-        diffusion_step = self.batchify_diffusion_steps(
-            diffusion_step_idx=diffusion_step_idx, batch_size=noisy_image.size(0),
-        )
-        pred_noise = self(noisy_image=noisy_image, diffusion_step=diffusion_step)
-        alpha_bar_t = self.index(self.alpha_bar, diffusion_step=diffusion_step)
-        pred_ori_image  = self.predict_ori_image(
-            noisy_image=noisy_image, noise=pred_noise, alpha_bar_t=alpha_bar_t,
-        )
+    def sample(self, batch_size):
+        x = self.sample_noise(batch_size=batch_size)
+        for subsequence_idx in tqdm(range(self.n_subsequence_steps - 1, 0, -1)):
+            batched_subsequence_idx = self.batchify_diffusion_steps(diffusion_step_idx=subsequence_idx, batch_size=batch_size)
+            cur_step = self.index(self.subsequence_step, batched_subsequence_idx)
+            prev_step = self.index(self.subsequence_step, batched_subsequence_idx - 1)
+
+            alpha_bar_t = self.alpha_bar.to(self.device)[cur_step]
+            prev_alpha_bar_t = self.alpha_bar.to(self.device)[prev_step]
+            beta_t = 1 - alpha_bar_t / prev_alpha_bar_t
+
+            # print(x.shape, cur_step.shape)
+            pred_noise = self(noisy_image=x.detach(), diffusion_step=cur_step[:, 0, 0, 0])
+            model_mean = (1 / ((1 - beta_t) ** 0.5)) * (
+                x - ((beta_t / ((1 - alpha_bar_t) ** 0.5)) * pred_noise)
+            )
+            model_var = beta_t
+            rand_noise = self.sample_noise(batch_size=batch_size)
+            x = model_mean + (model_var ** 0.5) * rand_noise
+        return x
 
 
 if __name__ == "__main__":
-    n_diffusion_steps = 1000
+    n_diffusion_steps = 4000
     init_beta = 0.0001
     fin_beta = 0.02
     linear_beta = get_linear_beta_schdule(
         init_beta=init_beta, fin_beta=fin_beta, n_diffusion_steps=n_diffusion_steps,
     )
-    cos_beta = get_cos_beta_schedule(n_diffusion_steps=1000)
+    cos_beta = get_cos_beta_schedule(n_diffusion_steps=4000)
 
     linear_alpha = 1 - linear_beta
     linear_alpha_bar = torch.cumprod(linear_alpha, dim=0)
