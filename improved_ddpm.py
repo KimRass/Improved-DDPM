@@ -1,6 +1,5 @@
 # References:
     # https://nn.labml.ai/diffusion/ddpm/index.html
-    # https://github.com/davidADSP/Generative_Deep_Learning_2nd_Edition/blob/main/notebooks/08_diffusion/01_ddm/ddm.ipynb
     # https://huggingface.co/blog/annotated-diffusion
 
 import torch
@@ -23,11 +22,11 @@ class ImprovedDDPM(nn.Module):
         diffusion_step = torch.linspace(0, self.n_diffusion_steps - 1, self.n_diffusion_steps)
         f = torch.cos(((diffusion_step / self.n_diffusion_steps) + s) / (1 + s) * torch.pi / 2) ** 2
         self.alpha_bar = f / f[0]
-        self.prev_alpha_bar = torch.cat([torch.ones(size=(1,)), self.alpha_bar], dim=0)[: -1]
-        beta = 1 - (self.alpha_bar / self.prev_alpha_bar)
+        # self.prev_alpha_bar = torch.cat([torch.ones(size=(1,)), self.alpha_bar], dim=0)[: -1]
+        # beta = 1 - (self.alpha_bar / self.prev_alpha_bar)
         # "We clip $\beta_{t}$ to be no larger than $0.999$ to prevent singularities at the end
         # of the diffusion process near $t = T$."
-        self.beta = torch.clip(beta, 0, 0.999)
+        # self.beta = torch.clip(beta, 0, 0.999)
 
     def __init__(
         self,
@@ -68,11 +67,7 @@ class ImprovedDDPM(nn.Module):
 
     @staticmethod
     def index(x, diffusion_step):
-        return torch.index_select(
-            x,
-            dim=0,
-            index=torch.maximum(diffusion_step, torch.zeros_like(diffusion_step)),
-        )[:, None, None, None]
+        return x[torch.clip(diffusion_step, min=0)][:, None, None, None]
 
     def sample_noise(self, batch_size):
         return torch.randn(
